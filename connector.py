@@ -7,7 +7,7 @@ from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
 class GraphDBConnector:
     def __init__(self):
         self.driver = GraphDatabase.driver(
-            NEO4J_URI, 
+            NEO4J_URI,
             auth=(NEO4J_USER, NEO4J_PASSWORD)
         )
         self.session= self.driver.session(database=NEO4J_DATABASE)
@@ -15,8 +15,9 @@ class GraphDBConnector:
     def check_connection(self):
         try:
             self.driver.verify_connectivity()
+            print("Connection successful")
         except ClientError as error:
-            print(f"Connection Failed")
+            print(f"Connection Failed: {error}")
             
     def close(self):
         if self.session:

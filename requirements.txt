@@ -1,0 +1,5 @@
+neo4j==6.1.0
+python-dotenv==1.2.1
+google-genai>=1.0.0
+python-Levenshtein==0.27.3
+pytest==9.0.2

@@ -1,0 +1,105 @@
+{
+  "domain": "medical",
+  "description": "Medical knowledge graph: Drugs, Diseases, SideEffects, Symptoms",
+
+  "intent_patterns": {
+
+    "indirect_symptoms": {
+      "strategy": "chained",
+      "keywords": ["indirectly", "diseases it treats", "indirect symptom", "what symptoms does", "related symptoms"],
+      "entry_label": "Drug",
+      "hops": [
+        {"relationship": "TREATS",      "target_label": "Disease"},
+        {"relationship": "HAS_SYMPTOM", "target_label": "Symptom"}
+      ]
+    },
+
+    "drug_risk_chain": {
+      "strategy": "chained",
+      "keywords": ["increases risk of", "risk chain", "lead to", "leads to"],
+      "entry_label": "Drug",
+      "hops": [
+        {"relationship": "CAUSES",            "target_label": "SideEffect"},
+        {"relationship": "INCREASES_RISK_OF", "target_label": "Disease"}
+      ]
+    },
+
+    "shared_effects": {
+      "strategy": "shared_neighbor",
+      "keywords": ["in common", "both cause", "both treat", "share", "same effect", "common side effect"],
+      "min_connections": 2
+    },
+
+    "connection": {
+      "strategy": "shortest_path",
+      "keywords": ["connected", "how is", "what connects", "path between", "link between", "relationship between", "how are"],
+      "max_hops": 6
+    },
+
+    "neighborhood": {
+      "strategy": "variable_hop",
+      "keywords": ["everything about", "overview of", "related to", "all about", "full profile"],
+      "min_hops": 1,
+      "max_hops": 2
+    },
+
+    "side_effects": {
+      "strategy": "targeted",
+      "keywords": ["side effect", "side effects", "adverse", "risk", "cause", "causes", "what does it cause"],
+      "source_label": "Drug",
+      "relationship": "CAUSES",
+      "target_label": "SideEffect",
+      "entry_anchor": "source"
+    },
+
+    "treated_by": {
+      "strategy": "targeted",
+      "keywords": ["what treats", "treatment for", "treated by", "what can i take for", "what drug", "what medication"],
+      "source_label": "Drug",
+      "relationship": "TREATS",
+      "target_label": "Disease",
+      "entry_anchor": "target"
+    },
+
+    "treatment": {
+      "strategy": "targeted",
+      "keywords": ["treat", "cure", "does it help", "medicine for", "drug for", "what does it treat"],
+      "source_label": "Drug",
+      "relationship": "TREATS",
+      "target_label": "Disease",
+      "entry_anchor": "source"
+    },
+
+    "interaction": {
+      "strategy": "targeted",
+      "keywords": ["interact", "interaction", "combine", "take with", "safe with", "together", "can i take"],
+      "source_label": "Drug",
+      "relationship": "INTERACTS_WITH",
+      "target_label": "Drug",
+      "entry_anchor": "either"
+    },
+
+    "symptoms": {
+      "strategy": "targeted",
+      "keywords": ["symptom", "symptoms", "signs", "presents with", "how does it feel"],
+      "source_label": "Disease",
+      "relationship": "HAS_SYMPTOM",
+      "target_label": "Symptom",
+      "entry_anchor": "source"
+    }
+
+  },
+
+  "relationship_templates": {
+    "TREATS":            "{source} treats {target}",
+    "CAUSES":            "{source} may cause {target}",
+    "INTERACTS_WITH":    "{source} interacts with {target}",
+    "HAS_SYMPTOM":       "{source} has symptom: {target}",
+    "INCREASES_RISK_OF": "{source} increases risk of {target}",
+    "METABOLIZED_BY":    "{source} is metabolized by {target}"
+  },
+
+  "general_traversal": {
+    "node_limit": 30
+  }
+}
