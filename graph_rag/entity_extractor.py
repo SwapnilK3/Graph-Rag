@@ -125,7 +125,7 @@ class QueryTimeEntityExtractor:
 
     def extract_entry_nodes(self, query: str) -> list[dict]:
         """
-        V2 Extractor: Uses LLM-aided extraction + Semantic Search.
+        V2.5 Extractor: Uses LLM-aided extraction + Semantic + Label Match.
         """
         if not query or not query.strip():
             return []
@@ -138,7 +138,7 @@ class QueryTimeEntityExtractor:
         
         # Combine and prioritize LLM results
         all_candidates = list(dict.fromkeys(llm_entities + ngram_keywords))
-        logger.debug("V2 candidate list (LLM + n-grams): %s", all_candidates)
+        logger.debug("V2.5 candidate list (LLM + n-grams): %s", all_candidates)
 
         seen_ids: set[str] = set()
         entry_nodes: list[dict] = []
@@ -152,13 +152,42 @@ class QueryTimeEntityExtractor:
                     seen_ids.add(node_id)
                     entry_nodes.append(node)
 
-        # Final check: if still empty, try one broad semantic search of the whole query
+        # 3. Label match: check if query mentions a node TYPE (e.g., "drugs", "diseases")
+        if not entry_nodes:
+            logger.info("No specific nodes found; trying label match.")
+            entry_nodes = self._label_match(query)
+
+        # 4. Final: broad semantic search of the whole query
         if not entry_nodes and self.llm:
-            logger.info("Lexical/Candidate search failed; trying broad semantic search.")
+            logger.info("Label match failed; trying broad semantic search.")
             entry_nodes = self._semantic_search(query, limit=5)
 
         logger.info("Found %d entry node(s)", len(entry_nodes))
         return entry_nodes
+
+    def _label_match(self, query: str) -> list[dict]:
+        """
+        Check if query mentions a graph label (node type) like 'drugs', 'diseases'.
+        If so, return sample nodes of that type to enable pattern-based reasoning.
+        """
+        q_lower = query.lower()
+        for label in (self.node_labels or []):
+            label_lower = label.lower()
+            # Match singular, plural, or substring
+            if label_lower in q_lower or (label_lower + "s") in q_lower:
+                cypher = f"""
+                MATCH (n:{label})-[r]->()
+                WITH n, count(r) AS rels
+                ORDER BY rels DESC
+                RETURN elementId(n) as id, labels(n)[0] as label, 
+                       properties(n) as properties
+                LIMIT 5
+                """
+                rows = self.connector.execute_query(cypher)
+                if rows:
+                    logger.info("Label match: found %d sample %s nodes", len(rows), label)
+                    return [self._row_to_node(r) for r in rows]
+        return []
 
     # ------------------------------------------------------------------
     # V2 Search logic

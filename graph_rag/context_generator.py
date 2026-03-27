@@ -56,12 +56,12 @@ class ContextGenerator:
         return self.generate_template(subgraph)
 
     def generate_template(self, subgraph: dict) -> str:
-        """Standard V1 template-based generation."""
+        """Standard V1 template-based generation with deduplication and compression."""
         nodes = subgraph.get("nodes", [])
         relationships = subgraph.get("relationships", [])
         
         if not nodes:
-            return "No relevant information found in the knowledge graph."
+            return ""  # Domain guard handles the "out of scope" messaging
 
         id_to_name = {n["id"]: n["name"] or n["label"] for n in nodes}
         lines = ["ENTITIES:"]
@@ -70,8 +70,21 @@ class ContextGenerator:
             lines.append(f"  - [{label}] {name}")
 
         if relationships:
-            lines.append("\nRELATIONSHIPS:")
+            # Deduplicate: same source→target→type = one fact
+            seen_rels: set[tuple] = set()
+            unique_rels: list[dict] = []
             for rel in relationships:
+                key = (rel["source_id"], rel["target_id"], rel["type"])
+                if key not in seen_rels:
+                    seen_rels.add(key)
+                    unique_rels.append(rel)
+            
+            # Cap at 20 to limit token usage
+            if len(unique_rels) > 20:
+                unique_rels = unique_rels[:20]
+
+            lines.append("\nRELATIONSHIPS:")
+            for rel in unique_rels:
                 src = id_to_name.get(rel["source_id"], "Unknown")
                 tgt = id_to_name.get(rel["target_id"], "Unknown")
                 tmpl = self._rel_templates.get(rel["type"], _DEFAULT_REL_TEMPLATE)

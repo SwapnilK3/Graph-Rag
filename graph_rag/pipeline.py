@@ -36,6 +36,8 @@ from .entity_extractor import QueryTimeEntityExtractor
 from .intent_classifier import IntentClassifier
 from .traversal_engine import SmartTraversalEngine
 from .context_generator import ContextGenerator
+from .subgraph_filter import SubgraphFilter
+from .path_scorer import PathScorer
 from .llm_interface import LLMInterface
 
 logger = logging.getLogger(__name__)
@@ -80,10 +82,17 @@ class GraphRAGPipeline:
         if config:
             self.config = config
         elif domain:
-            from .config import load_domain_config
-            self.config = load_domain_config(domain)
-            if verbose:
-                print(f"  Loaded config for domain: {domain}")
+            try:
+                from .config import load_domain_config
+                self.config = load_domain_config(domain)
+                if verbose:
+                    print(f"  Loaded config for domain: {domain}")
+            except FileNotFoundError:
+                logger.info("No config file for domain '%s' — falling back to auto-discovery", domain)
+                generator = AutoConfigGenerator(self.schema)
+                self.config = generator.generate()
+                if verbose:
+                    generator.print_config(self.config)
         else:
             generator = AutoConfigGenerator(self.schema)
             self.config = generator.generate()
@@ -104,7 +113,7 @@ class GraphRAGPipeline:
             else:
                 logger.info("GEMINI_API_KEY not set — LLM disabled")
 
-        # ── Step 5: Initialize other components ───────────────────────
+        # ── Step 5: Initialize components ─────────────────────────────
 
         # Collect ALL searchable properties across all labels
         all_search_props = set()
@@ -114,12 +123,15 @@ class GraphRAGPipeline:
 
         self.extractor = QueryTimeEntityExtractor(
             self.connector,
-            llm=self.llm,  # Passed for V2 semantic search
+            llm=self.llm,
             search_properties=search_props,
+            node_labels=self.schema.get("node_labels"),
         )
         self.classifier = IntentClassifier(self.config, llm=self.llm)
         self.engine     = SmartTraversalEngine(self.connector, self.config)
         self.generator  = ContextGenerator(self.config, llm=self.llm)
+        self.subgraph_filter = SubgraphFilter(self.config)
+        self.path_scorer     = PathScorer(self.config)
 
         if verbose:
             status = "enabled" if self.llm else "disabled"
@@ -133,69 +145,115 @@ class GraphRAGPipeline:
 
     def query(self, user_query: str, max_retries: int = 2) -> dict:
         """
-        V2 Agentic Query: Extends the standard pipeline with a reflection loop.
-        If the initial search is insufficient, it attempts to re-plan.
+        V2.5 Pipeline with Domain Guard + Adaptive Retry.
+
+        Phase 0: Domain Guard — extract entities. If nothing found, reject early.
+        Phase 1: Retrieve — intent → traverse → filter → context.
+        Phase 2: Reflect — if quality insufficient, re-plan and re-extract.
+        Phase 3: Synthesize — LLM answer from grounded context only.
         """
         trace = []
         timing = {}
-        
-        # Initial search state
+
+        # ── Phase 0: Domain Guard ─────────────────────────────────────
+        t0 = time.perf_counter()
+        initial_entry_nodes = self.extractor.extract_entry_nodes(user_query)
+        timing["domain_guard_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        if not initial_entry_nodes:
+            # No matching entity in graph → out of scope. NO LLM call.
+            logger.info("Domain guard: no matching entities for '%s'. Rejecting.", user_query)
+            trace.append({
+                "step": 0, "action": "domain_guard",
+                "result": "rejected", "reason": "no_matching_entities",
+            })
+            return {
+                "query":       user_query,
+                "entry_nodes": [],
+                "intent":      "out_of_scope",
+                "strategy":    "none",
+                "hop_depth":   0,
+                "subgraph":    {"nodes": [], "relationships": []},
+                "context":     "",
+                "answer":      "This question is outside the scope of the available knowledge graph. "
+                               "No matching entities were found.",
+                "thought_process": trace,
+                "timing":      timing,
+            }
+
+        # ── Phase 1 + 2: Retrieve with adaptive retry ────────────────
         current_query = user_query
+        current_entry_nodes = initial_entry_nodes
         best_subgraph = {"nodes": [], "relationships": []}
         best_context = ""
         best_intent = "none"
-        best_quality = 0  # Fix 7: Use fact count as quality metric
-        
+        best_quality = 0
+
         for attempt in range(max_retries + 1):
-            step_start = time.perf_counter()
-            logger.info("Starting reasoning step %d", attempt + 1)
-            
-            # Step 1: Entity extraction
+            logger.info("Reasoning step %d (query='%s')", attempt + 1, current_query)
+
+            # Step 1: Use pre-extracted nodes on first attempt, re-extract on retries
+            if attempt > 0:
+                t0 = time.perf_counter()
+                current_entry_nodes = self.extractor.extract_entry_nodes(current_query)
+                timing[f"step{attempt}_extract_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                if not current_entry_nodes:
+                    trace.append({"step": attempt + 1, "action": "re-extract", "result": "no_entities"})
+                    continue
+
+            # Step 2: Intent classification (re-classifies on each attempt)
             t0 = time.perf_counter()
-            entry_nodes = self.extractor.extract_entry_nodes(current_query)
-            timing[f"step{attempt}_extract_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            intent = self.classifier.classify(current_query)
+            timing[f"step{attempt}_classify_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-            if entry_nodes:
-                # Step 2: Intent classification (Fix 8: re-classify on each attempt)
-                t0 = time.perf_counter()
-                intent = self.classifier.classify(current_query)
-                timing[f"step{attempt}_classify_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            # Step 3: Graph traversal
+            t0 = time.perf_counter()
+            # Abstract queries use neighborhood exploration
+            traverse_intent = "neighborhood" if intent == "abstract" else intent
+            subgraph = self.engine.traverse(current_entry_nodes, traverse_intent)
+            timing[f"step{attempt}_traverse_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-                # Step 3: Graph traversal
-                t0 = time.perf_counter()
-                subgraph = self.engine.traverse(entry_nodes, intent)
-                timing[f"step{attempt}_traverse_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            # Step 3.5: Subgraph filtering
+            if hasattr(self, 'subgraph_filter'):
+                subgraph = self.subgraph_filter.filter(subgraph, intent, current_query)
 
-                # Step 4: Context generation
-                t0 = time.perf_counter()
+            # Step 3.6: Path scoring and ranking
+            if hasattr(self, 'path_scorer'):
+                subgraph = self.path_scorer.score_and_rank(subgraph, intent, current_query)
+
+            # Step 4: Context generation
+            t0 = time.perf_counter()
+            if intent == "abstract":
+                context = self._generate_pattern_context(subgraph)
+            else:
                 context = self.generator.generate(subgraph)
-                timing[f"step{attempt}_context_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-                
-                # Fix 7: Quality metric — entity coverage ratio instead of string length
-                rel_count = len(subgraph.get("relationships", []))
-                node_count = len(subgraph.get("nodes", []))
-                quality_score = rel_count + node_count  # facts found
-                
-                if quality_score > best_quality:
-                    best_subgraph = subgraph
-                    best_context = context
-                    best_intent = intent
-                    best_quality = quality_score
-                
-                trace.append({
-                    "step": attempt + 1,
-                    "nodes": [n.get("name") for n in entry_nodes],
-                    "intent": intent,
-                    "found_facts": rel_count,
-                    "quality_score": quality_score,
-                })
+            timing[f"step{attempt}_context_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-            # Fix 7: Reflection based on fact count, not string length
+            # Quality metric: entity + relationship count
+            rel_count = len(subgraph.get("relationships", []))
+            node_count = len(subgraph.get("nodes", []))
+            quality_score = rel_count + node_count
+
+            if quality_score > best_quality:
+                best_subgraph = subgraph
+                best_context = context
+                best_intent = intent
+                best_quality = quality_score
+
+            trace.append({
+                "step": attempt + 1,
+                "query": current_query,
+                "nodes": [n.get("name") for n in current_entry_nodes],
+                "intent": intent,
+                "found_facts": rel_count,
+                "quality_score": quality_score,
+            })
+
+            # Reflection: sufficient data?
             if best_quality >= 5 or attempt == max_retries:
-                # Sufficient data found (>=5 facts) or max retries reached
                 break
-            
-            # Re-planning: Ask LLM for a better search term
+
+            # Re-plan for next attempt
             logger.info("Context insufficient (quality=%d). Re-planning...", best_quality)
             new_guidance = self._replan(user_query, best_context, trace)
             if new_guidance:
@@ -203,7 +261,7 @@ class GraphRAGPipeline:
             else:
                 break
 
-        # Final Step: LLM answer
+        # ── Phase 3: LLM Synthesis (only if we have real context) ─────
         answer = None
         if self.llm and best_context:
             t0 = time.perf_counter()
@@ -221,11 +279,54 @@ class GraphRAGPipeline:
             "strategy":    best_subgraph.get("strategy", "unknown"),
             "hop_depth":   best_subgraph.get("hop_depth", 0),
             "subgraph":    best_subgraph,
-            "context":     best_context or "No matching information found.",
+            "context":     best_context if best_context else "No matching information found.",
             "answer":      answer,
             "thought_process": trace,
             "timing":      timing,
         }
+
+    def _generate_pattern_context(self, subgraph: dict) -> str:
+        """
+        For abstract queries: group relationships by type and count,
+        producing pattern-based context instead of triple dumps.
+
+        E.g., Drug → TREATS Disease (5x), CAUSES SideEffect (3x)
+        → "Drugs are primarily used to treat diseases."
+        """
+        nodes = subgraph.get("nodes", [])
+        relationships = subgraph.get("relationships", [])
+        if not relationships:
+            return ""
+
+        id_to_name = {n["id"]: n.get("name") or n.get("label", "?") for n in nodes}
+
+        # Group by relationship type with examples
+        groups: dict[str, list[str]] = {}
+        for rel in relationships:
+            rel_type = rel["type"]
+            src = id_to_name.get(rel["source_id"], "?")
+            tgt = id_to_name.get(rel["target_id"], "?")
+            if rel_type not in groups:
+                groups[rel_type] = []
+            groups[rel_type].append(f"{src} → {tgt}")
+
+        # Build pattern context
+        lines = ["RELATIONSHIP PATTERNS (sorted by frequency):"]
+        for rel_type, examples in sorted(groups.items(), key=lambda x: -len(x[1])):
+            tmpl = self.generator._rel_templates.get(rel_type, f"{{source}} {rel_type} {{target}}")
+            sample = examples[0] if examples else "?"
+            lines.append(f"  - {rel_type}: {len(examples)} instance(s) — e.g., \"{sample}\"")
+
+        # Also list unique entity types involved
+        label_counts: dict[str, int] = {}
+        for n in nodes:
+            lbl = n.get("label", "Unknown")
+            label_counts[lbl] = label_counts.get(lbl, 0) + 1
+        lines.append("\nENTITY TYPES:")
+        for lbl, cnt in sorted(label_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  - {lbl}: {cnt} node(s)")
+
+        return "\n".join(lines)
 
     def _replan(self, query: str, context: str, trace: list) -> Optional[str]:
         """Ask the LLM to provide a better search focus based on what we've missed."""

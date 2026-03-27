@@ -15,8 +15,15 @@ def _load_config(config_path_or_dict) -> dict:
 class IntentClassifier:
     """
     Classifies a user query into a named intent.
-    V2 features: LLM-based 'Inference' classification with keyword fallback.
+    V2.5: Abstract query detection + LLM inference + keyword fallback.
     """
+
+    # Markers that indicate an abstract/meta query (pattern reasoning, not triple retrieval)
+    ABSTRACT_MARKERS = frozenset({
+        "why", "purpose", "reason", "explain", "how come",
+        "what is the role", "what are the roles", "what is the use",
+        "what are the uses", "overview", "summary", "describe",
+    })
 
     def __init__(self, config: str | dict, llm: Optional[LLMInterface] = None):
         loaded = _load_config(config)
@@ -36,18 +43,31 @@ class IntentClassifier:
 
     def classify(self, query: str) -> str:
         """
-        Hybrid Classification: LLM Inference → Keyword Match → General.
+        Hybrid Classification: Abstract Detection → LLM Inference → Keyword Match → General.
         """
+        q_lower = query.lower()
+
+        # Priority 1: Abstract/meta query detection
+        if any(marker in q_lower for marker in self.ABSTRACT_MARKERS):
+            # Only use abstract if no specific intent keyword also matches
+            has_specific = any(
+                any(kw in q_lower for kw in keywords)
+                for keywords in self._patterns.values()
+            )
+            if not has_specific:
+                logger.info("Abstract query detected: '%s'", query)
+                return "abstract"
+
+        # Priority 2: LLM inference
         if self.llm:
             intent = self._classify_with_llm(query)
             if intent and intent in self._patterns:
                 logger.info("LLM classified intent: %s", intent)
                 return intent
 
-        # Fallback to V1 Keyword Matching
-        q = query.lower()
+        # Priority 3: Keyword Matching
         for intent, keywords in self._patterns.items():
-            if any(kw in q for kw in keywords):
+            if any(kw in q_lower for kw in keywords):
                 logger.debug("Keyword match for intent: %s", intent)
                 return intent
                 
