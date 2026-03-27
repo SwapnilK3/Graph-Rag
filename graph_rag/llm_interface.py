@@ -88,3 +88,52 @@ class LLMInterface:
             config=types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT),
         )
         return response.text.strip()
+
+    def generate_text(self, prompt: str) -> str:
+        """
+        Generate a text response from the LLM for a given prompt.
+        Use this instead of accessing _client directly.
+
+        Args:
+            prompt: The prompt string to send to the model.
+
+        Returns:
+            The LLM's response as a plain string.
+        """
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+        )
+        return response.text.strip()
+
+    def embed_text(self, text: str, task_type: str = "RETRIEVAL_QUERY") -> list[float]:
+        """
+        Generate a vector embedding for a single string.
+        
+        Args:
+            text: The string to embed.
+            task_type: The purpose of the embedding (RETRIEVAL_QUERY, RETRIEVAL_DOCUMENT, etc.)
+            
+        Returns:
+            A list of floats (embedding vector).
+        """
+        response = self._client.models.embed_content(
+            model="text-embedding-004",
+            contents=text,
+            config=types.EmbedContentConfig(task_type=task_type)
+        )
+        return response.embeddings[0].values
+
+    def embed_batch(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+        """
+        Generate embeddings for a list of strings in one call.
+        """
+        if not texts:
+            return []
+            
+        response = self._client.models.embed_content(
+            model="text-embedding-004",
+            contents=texts,
+            config=types.EmbedContentConfig(task_type=task_type)
+        )
+        return [e.values for e in response.embeddings]

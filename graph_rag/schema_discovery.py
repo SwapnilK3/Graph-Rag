@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from connector import GraphDBConnector
+from .connector import GraphDBConnector
 
 logger = logging.getLogger(__name__)
 

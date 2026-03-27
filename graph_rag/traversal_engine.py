@@ -26,7 +26,7 @@ Subgraph format (returned by every strategy)
 """
 
 import json
-from connector import GraphDBConnector
+from .connector import GraphDBConnector
 
 
 def _load_config(config_path_or_dict) -> dict:
