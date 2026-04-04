@@ -59,6 +59,7 @@ class LLMInterface:
         self,
         api_key: str | None = None,
         model: str = "gemini-2.5-flash",
+        max_retries: int = 2,
     ):
         key = api_key or os.getenv("GEMINI_API_KEY")
         if not key or key == "your_gemini_api_key_here":
@@ -69,22 +70,89 @@ class LLMInterface:
             )
         self._client = genai.Client(api_key=key)
         self._model = model
+        self._max_retries = max_retries
+
+    def _call_with_retry(self, fn, *args, **kwargs):
+        """Call a function with automatic retry on rate limit errors."""
+        import time as _time
+        import logging as _log
+        logger = _log.getLogger(__name__)
+
+        last_error = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                    logger.warning(
+                        "Rate limited (attempt %d/%d). Retrying in %ds...",
+                        attempt + 1, self._max_retries + 1, wait
+                    )
+                    last_error = e
+                    _time.sleep(wait)
+                else:
+                    raise  # Non-rate-limit errors propagate immediately
+        raise last_error  # All retries exhausted
 
     def answer(self, query: str, context: str) -> str:
         """
-        Generate a grounded answer from the LLM.
-
-        Args:
-            query:   The original user question.
-            context: The knowledge graph context string from ContextGenerator.
-
-        Returns:
-            The LLM's answer as a plain string.
+        Generate a grounded answer from the LLM with retry on rate limit.
         """
         prompt = _USER_PROMPT_TEMPLATE.format(context=context, query=query)
-        response = self._client.models.generate_content(
-            model=self._model,
-            contents=prompt,
-            config=types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT),
+
+        def _call():
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT),
+            )
+            return response.text.strip()
+
+        return self._call_with_retry(_call)
+
+    def generate_text(self, prompt: str) -> str:
+        """
+        Generate a text response for a prompt with retry on rate limit.
+        """
+        def _call():
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+            )
+            return response.text.strip()
+
+        return self._call_with_retry(_call)
+
+    def embed_text(self, text: str, task_type: str = "RETRIEVAL_QUERY") -> list[float]:
+        """
+        Generate a vector embedding for a single string.
+        
+        Args:
+            text: The string to embed.
+            task_type: The purpose of the embedding (RETRIEVAL_QUERY, RETRIEVAL_DOCUMENT, etc.)
+            
+        Returns:
+            A list of floats (embedding vector).
+        """
+        response = self._client.models.embed_content(
+            model="text-embedding-004",
+            contents=text,
+            config=types.EmbedContentConfig(task_type=task_type)
         )
-        return response.text.strip()
+        return response.embeddings[0].values
+
+    def embed_batch(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+        """
+        Generate embeddings for a list of strings in one call.
+        """
+        if not texts:
+            return []
+            
+        response = self._client.models.embed_content(
+            model="text-embedding-004",
+            contents=texts,
+            config=types.EmbedContentConfig(task_type=task_type)
+        )
+        return [e.values for e in response.embeddings]

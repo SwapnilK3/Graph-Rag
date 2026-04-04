@@ -21,13 +21,16 @@ RELATIONSHIPS:
 """
 
 import json
+import logging
+from typing import Optional
+from .llm_interface import LLMInterface
 
+logger = logging.getLogger(__name__)
 
 _DEFAULT_REL_TEMPLATE = "{source} --{type}--> {target}"
 
 
 def _load_config(config_path_or_dict) -> dict:
-    """Accept a file path (str) or a config dict directly."""
     if isinstance(config_path_or_dict, dict):
         return config_path_or_dict
     with open(config_path_or_dict) as f:
@@ -36,77 +39,56 @@ def _load_config(config_path_or_dict) -> dict:
 
 class ContextGenerator:
     """
-    Converts a subgraph dict produced by SmartTraversalEngine into
-    structured text suitable for an LLM prompt.
-
-    Parameters
-    ----------
-    config:
-        Path to a domain config JSON file (str), OR a config dict.
-        Reads "relationship_templates" to produce natural-language
-        relationship sentences.
+    Converts a subgraph dict into structured text.
+    V2 features: LLM-based narrative synthesis for more coherent prompts.
     """
 
-    def __init__(self, config: str | dict):
+    def __init__(self, config: str | dict, llm: Optional[LLMInterface] = None):
         loaded = _load_config(config)
+        self.llm = llm
         self._rel_templates: dict[str, str] = loaded.get("relationship_templates", {})
 
     def generate(self, subgraph: dict) -> str:
         """
-        Convert subgraph to plain text context.
-
-        Args:
-            subgraph: Dict with "nodes" and "relationships" lists.
-
-        Returns:
-            Formatted string ready to inject into an LLM prompt.
+        Main entry point. Always uses template-based factual generation
+        to preserve zero-hallucination grounding.
         """
+        return self.generate_template(subgraph)
+
+    def generate_template(self, subgraph: dict) -> str:
+        """Standard V1 template-based generation with deduplication and compression."""
         nodes = subgraph.get("nodes", [])
         relationships = subgraph.get("relationships", [])
-        strategy  = subgraph.get("strategy", "")
-        hop_depth = subgraph.get("hop_depth", 1)
-
+        
         if not nodes:
-            return "No relevant information found in the knowledge graph."
+            return ""  # Domain guard handles the "out of scope" messaging
 
-        # id → display name for relationship sentences
-        id_to_name: dict[str, str] = {
-            n["id"]: n["name"] or n["label"] for n in nodes
-        }
-
-        lines: list[str] = []
-        if strategy:
-            lines.append(
-                f"[Traversal: {strategy}, depth={hop_depth}, "
-                f"{len(nodes)} nodes, {len(relationships)} edges]"
-            )
-            lines.append("")
-
-        lines.append("ENTITIES:")
+        id_to_name = {n["id"]: n["name"] or n["label"] for n in nodes}
+        lines = ["ENTITIES:"]
         for node in nodes:
-            label = node["label"]
-            name  = node["name"] or "(unnamed)"
-            # Show extra properties (skip 'name' itself, skip empty values)
-            extras = [
-                f"{k}: {v}"
-                for k, v in node.get("properties", {}).items()
-                if k != "name" and v not in (None, "")
-            ]
-            detail = f" ({', '.join(extras)})" if extras else ""
-            lines.append(f"  - [{label}] {name}{detail}")
+            label, name = node["label"], node["name"] or "(unnamed)"
+            lines.append(f"  - [{label}] {name}")
 
         if relationships:
-            lines.append("\nRELATIONSHIPS:")
+            # Deduplicate: same source→target→type = one fact
+            seen_rels: set[tuple] = set()
+            unique_rels: list[dict] = []
             for rel in relationships:
-                src_name = id_to_name.get(rel["source_id"], rel["source_id"])
-                tgt_name = id_to_name.get(rel["target_id"], rel["target_id"])
-                rel_type = rel["type"]
-                template = self._rel_templates.get(rel_type, _DEFAULT_REL_TEMPLATE)
-                sentence = template.format(
-                    source=src_name,
-                    target=tgt_name,
-                    type=rel_type,
-                )
-                lines.append(f"  - {sentence}")
+                key = (rel["source_id"], rel["target_id"], rel["type"])
+                if key not in seen_rels:
+                    seen_rels.add(key)
+                    unique_rels.append(rel)
+            
+            # Cap at 20 to limit token usage
+            if len(unique_rels) > 20:
+                unique_rels = unique_rels[:20]
+
+            lines.append("\nRELATIONSHIPS:")
+            for rel in unique_rels:
+                src = id_to_name.get(rel["source_id"], "Unknown")
+                tgt = id_to_name.get(rel["target_id"], "Unknown")
+                tmpl = self._rel_templates.get(rel["type"], _DEFAULT_REL_TEMPLATE)
+                lines.append(f"  - {tmpl.format(source=src, target=tgt, type=rel['type'])}")
 
         return "\n".join(lines)
+

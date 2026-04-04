@@ -26,7 +26,7 @@ Subgraph format (returned by every strategy)
 """
 
 import json
-from connector import GraphDBConnector
+from .connector import GraphDBConnector
 
 
 def _load_config(config_path_or_dict) -> dict:
@@ -197,8 +197,9 @@ class SmartTraversalEngine:
         min_h = pattern.get("min_hops", 1)
         max_h = pattern.get("max_hops", 2)
 
+        # FIX: Directional traversal -> to prevent reverse-edge nonsense
         cypher = f"""
-            MATCH path = (source)-[*{min_h}..{max_h}]-(target)
+            MATCH path = (source)-[*{min_h}..{max_h}]->(target)
             WHERE elementId(source) IN $ids AND source <> target
             WITH path LIMIT 60
             {_PATH_UNWIND}
@@ -282,9 +283,10 @@ class SmartTraversalEngine:
     # ------------------------------------------------------------------
 
     def _general(self, entry_ids: list[str], _pattern: dict) -> tuple[list[dict], int]:
-        """One-hop exploration in both directions, no relationship filter."""
+        """One-hop exploration following edge direction, no relationship filter."""
+        # FIX: Directional -> to prevent reverse-edge nonsense
         cypher = f"""
-            MATCH (src)-[r]-(tgt)
+            MATCH (src)-[r]->(tgt)
             WHERE elementId(src) IN $ids
             {_EDGE_RETURN}
             LIMIT {self._general_limit}

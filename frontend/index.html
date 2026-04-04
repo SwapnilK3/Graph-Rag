@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graph-RAG | Multi-KG Platform</title>
+    <meta name="description" content="Graph-RAG V3.2 — Plug-and-Play Knowledge Graph Reasoning">
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- D3.js for graph visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Outfit', 'sans-serif'] },
+                    colors: {
+                        brand: {
+                            50: '#f0fdfa', 100: '#ccfbf1', 200: '#99f6e4', 300: '#5eead4',
+                            400: '#2dd4bf', 500: '#14b8a6', 600: '#0d9488', 700: '#0f766e',
+                            800: '#115e59', 900: '#134e4a', 950: '#042f2e',
+                        },
+                        bg: '#0f0f10',
+                        sidebar: '#161617',
+                        card: '#1e1e20',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #0f0f10;
+            color: #e8e8e8;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        .sidebar-item:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .sidebar-item.active {
+            background-color: rgba(255, 255, 255, 0.08);
+            color: #fff;
+        }
+
+        .glass {
+            background: rgba(22, 22, 23, 0.8);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .bg-mesh {
+            background-image: radial-gradient(at 0% 0%, hsla(253, 16%, 7%, 1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225, 39%, 25%, 0.15) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339, 49%, 25%, 0.08) 0, transparent 50%);
+        }
+
+        .scrollbar-hide::-webkit-scrollbar {
+            display: none;
+        }
+
+        .thought-step {
+            border-left: 2px solid #6366f1;
+            margin-left: 0.5rem;
+            padding-left: 1rem;
+            position: relative;
+        }
+
+        .thought-step::before {
+            content: '';
+            position: absolute;
+            left: -5px;
+            top: 0.5rem;
+            width: 8px;
+            height: 8px;
+            background: #6366f1;
+            border-radius: 50%;
+        }
+
+        .graph-container svg {
+            width: 100%;
+            height: 300px;
+            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.3);
+        }
+
+        .nodes circle {
+            stroke: rgba(255, 255, 255, 0.4);
+            stroke-width: 1.5px;
+            cursor: grab;
+        }
+
+        .links line {
+            stroke: #555;
+            stroke-opacity: 0.5;
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in-up { animation: fadeInUp 0.5s ease-out; }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin { animation: spin 1s linear infinite; }
+    </style>
+</head>
+
+<body class="flex h-screen overflow-hidden bg-mesh">
+
+    <!-- Sidebar -->
+    <aside class="hidden md:flex flex-col w-60 border-r border-white/5 bg-sidebar">
+        <div class="p-5">
+            <div class="flex items-center space-x-2.5 mb-8">
+                <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-brand-400 to-indigo-600 flex items-center justify-center">
+                    <i data-lucide="brain" class="w-4 h-4 text-white"></i>
+                </div>
+                <span class="text-base font-semibold tracking-tight text-white">Graph-RAG</span>
+            </div>
+
+            <button id="new-thread"
+                class="w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-sm font-medium bg-white/5 border border-white/5 text-zinc-300 hover:bg-white/10 transition-colors mb-6">
+                <i data-lucide="plus" class="w-4 h-4"></i>
+                <span>New Thread</span>
+            </button>
+
+            <nav class="space-y-1">
+                <a href="#"
+                    class="sidebar-item active flex items-center space-x-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="search" class="w-4 h-4"></i>
+                    <span>Home</span>
+                </a>
+                <a href="#"
+                    class="sidebar-item flex items-center space-x-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors text-zinc-400">
+                    <i data-lucide="file-text" class="w-4 h-4"></i>
+                    <span>Discover</span>
+                </a>
+            </nav>
+
+            <!-- Knowledge Graphs Section -->
+            <div class="mt-10">
+                <h3 class="px-3 text-xs font-semibold text-zinc-500 uppercase tracking-widest mb-4">Knowledge Graphs</h3>
+                <div id="kg-list" class="space-y-1">
+                    <!-- Dynamically populated by app.js -->
+                    <div class="px-3 py-2 text-xs text-zinc-600 italic">Loading...</div>
+                </div>
+                <button id="open-connect-modal"
+                    class="w-full flex items-center space-x-2 px-3 py-2 mt-3 rounded-lg text-sm font-medium text-brand-400 hover:text-brand-300 hover:bg-brand-500/5 transition-all border border-dashed border-brand-500/20">
+                    <i data-lucide="plus-circle" class="w-4 h-4"></i>
+                    <span>Connect Graph</span>
+                </button>
+            </div>
+        </div>
+
+        <div class="mt-auto p-4 border-t border-white/5">
+            <div class="flex items-center justify-between px-2">
+                <div class="flex items-center space-x-2">
+                    <div id="status-dot" class="w-2 h-2 rounded-full bg-yellow-500"></div>
+                    <span id="status-text" class="text-xs text-zinc-500">Connecting...</span>
+                </div>
+                <div class="text-xs font-mono text-zinc-600">v3.2</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col relative overflow-hidden">
+
+        <!-- Header (Mobile) -->
+        <header class="md:hidden p-4 border-b border-white/5 flex justify-between items-center glass sticky top-0 z-40">
+            <span class="font-bold tracking-tight">Graph-RAG</span>
+            <button class="p-2"><i data-lucide="menu" class="w-6 h-6"></i></button>
+        </header>
+
+        <!-- Chat History Container -->
+        <div id="chat-history" class="flex-1 overflow-y-auto w-full px-4 py-8 md:py-16 space-y-10 scrollbar-hide">
+
+            <!-- Welcome Hero -->
+            <div id="welcome-hero"
+                class="max-w-3xl mx-auto flex flex-col items-center justify-center mt-20 space-y-8 animate-fade-in-up">
+                <div class="text-center space-y-3">
+                    <h1 class="text-4xl md:text-5xl font-bold tracking-tight text-white">Where knowledge begins.</h1>
+                    <p class="text-zinc-500 text-lg">Connect any Neo4j graph · Auto-discover schema · Query with AI</p>
+                </div>
+
+                <div class="flex flex-wrap justify-center gap-2 max-w-xl">
+                    <button
+                        class="suggestion-chip px-4 py-2 bg-white/5 border border-white/5 rounded-full text-sm text-zinc-400 hover:text-white hover:bg-white/10 transition-all">"Common
+                        side effects of Aspirin?"</button>
+                    <button
+                        class="suggestion-chip px-4 py-2 bg-white/5 border border-white/5 rounded-full text-sm text-zinc-400 hover:text-white hover:bg-white/10 transition-all">"What
+                        treats headaches?"</button>
+                    <button
+                        class="suggestion-chip px-4 py-2 bg-white/5 border border-white/5 rounded-full text-sm text-zinc-400 hover:text-white hover:bg-white/10 transition-all">"How
+                        is aspirin connected to peptic ulcer?"</button>
+                </div>
+            </div>
+
+            <!-- Messages will be appended here by app.js -->
+        </div>
+
+        <!-- Input Bar -->
+        <div class="w-full glass border-t border-white/5 p-4">
+            <div class="max-w-3xl mx-auto flex items-end gap-3">
+                <div class="flex-1 relative">
+                    <textarea id="query-input" rows="1" placeholder="Ask anything..."
+                        class="w-full bg-white/5 border border-white/10 rounded-xl py-3 px-4 pr-48 focus:outline-none focus:ring-1 focus:ring-brand-500/50 transition-all text-white placeholder-zinc-500 resize-none overflow-hidden text-base"
+                        style="min-height: 48px; max-height: 200px"></textarea>
+                    <div class="absolute right-2 bottom-2 flex items-center space-x-1">
+                        <button id="mode-toggle" title="Toggle between Fast (V2.5) and Agent (V3) mode"
+                            class="px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider bg-brand-500/10 text-brand-400 border border-brand-500/20 hover:bg-brand-500/20 transition-colors cursor-pointer">
+                            Fast
+                        </button>
+                        <span id="active-kg-badge"
+                            class="px-2 py-1 rounded text-[10px] font-bold text-zinc-500 bg-white/5 border border-white/5 truncate max-w-[100px]">
+                            default
+                        </span>
+                    </div>
+                </div>
+                <button id="send-btn"
+                    class="p-3 bg-brand-500 rounded-xl hover:bg-brand-400 transition-colors text-white flex-shrink-0">
+                    <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Connect Graph Modal -->
+    <div id="connect-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-[#161617] border border-white/10 rounded-2xl w-full max-w-md overflow-hidden animate-fade-in-up">
+            <div class="p-6 space-y-6">
+                <div class="flex items-center justify-between">
+                    <h2 class="text-lg font-bold text-white">Connect Knowledge Graph</h2>
+                    <button id="close-connect-modal" class="text-zinc-500 hover:text-white transition-colors">
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+
+                <div class="space-y-4">
+                    <div class="space-y-1.5">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Neo4j Bolt URI</label>
+                        <input id="db-uri" type="text" placeholder="bolt://localhost:7687"
+                            class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:ring-1 focus:ring-brand-500/50 placeholder-zinc-600">
+                    </div>
+                    <div class="space-y-1.5">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Database <span class="text-zinc-700">(optional)</span></label>
+                        <input id="db-database" type="text" placeholder="neo4j"
+                            class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:ring-1 focus:ring-brand-500/50 placeholder-zinc-600">
+                        <p class="text-[10px] text-zinc-600">Use the Neo4j database name/ID, not the instance name.</p>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="space-y-1.5">
+                            <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Username</label>
+                            <input id="db-user" type="text" placeholder="neo4j"
+                                class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:ring-1 focus:ring-brand-500/50 placeholder-zinc-600">
+                        </div>
+                        <div class="space-y-1.5">
+                            <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Password</label>
+                            <input id="db-pass" type="password" placeholder="••••••••"
+                                class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:ring-1 focus:ring-brand-500/50 placeholder-zinc-600">
+                        </div>
+                    </div>
+                    <div class="space-y-1.5">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Display Name <span class="text-zinc-700">(optional)</span></label>
+                        <input id="db-name" type="text" placeholder="My Movie Graph"
+                            class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:ring-1 focus:ring-brand-500/50 placeholder-zinc-600">
+                    </div>
+                </div>
+
+                <div id="connect-status" class="hidden px-4 py-3 rounded-lg text-xs"></div>
+
+                <button id="connect-btn"
+                    class="w-full py-3 bg-brand-500 rounded-xl hover:bg-brand-400 transition-all text-white font-semibold text-sm flex items-center justify-center gap-2">
+                    <i data-lucide="zap" class="w-4 h-4"></i>
+                    Connect & Discover
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+
+</html>
