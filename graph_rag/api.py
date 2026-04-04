@@ -1,14 +1,29 @@
+"""
+api.py
+------
+Graph-RAG API — V3.2 Multi-KG Platform
+
+Endpoints:
+  GET  /health              Health check
+  POST /graphs/connect      Register a new knowledge graph
+  GET  /graphs              List all registered KGs
+  GET  /graphs/{kg_id}      Get KG details + schema
+  DELETE /graphs/{kg_id}    Remove a KG
+  POST /query               Fast single-pass query (V2.5)
+  POST /agent/query         Agentic multi-step query (V3)
+  POST /memory/recall       Search episodic memory
+  GET  /memory/stats        Memory statistics
+"""
+
 import asyncio
-import os
 import logging
-from typing import Optional, Any
+from functools import partial
+from typing import Optional
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from .pipeline import GraphRAGPipeline
-from .connector import GraphDBConnector
-from .agent import GraphRAGAgent
+from pydantic import BaseModel
+from .graph_registry import GraphRegistry
 from .memory import AgentMemory
-from .evaluator import RAGEvaluator
+from .config import NEO4J_DATABASE
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -16,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Graph-RAG API", version="3.0.0")
+app = FastAPI(title="Graph-RAG API", version="3.2.0")
 
 # Enable CORS for frontend microservice
 app.add_middleware(
@@ -27,41 +42,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Cache ─────────────────────────────────────────────────────────────
-pipelines: dict[str, GraphRAGPipeline] = {}
-agents: dict[str, GraphRAGAgent] = {}
-memory_store: Optional[AgentMemory] = None
+# ── Registry (replaces old domain-based caching) ─────────────────────
+registry = GraphRegistry()
 
 
-def _get_pipeline(domain: str) -> GraphRAGPipeline:
-    """Get or create a cached pipeline for a domain."""
-    if domain not in pipelines:
-        logger.info("Initializing pipeline for domain: %s", domain)
-        pipelines[domain] = GraphRAGPipeline(domain=domain)
-    return pipelines[domain]
+@app.on_event("startup")
+async def startup_event():
+    """Register the default KG from .env on startup."""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, registry.ensure_default)
+        await loop.run_in_executor(None, partial(registry.get_pipeline, "default"))
+        try:
+            await loop.run_in_executor(None, partial(registry.get_agent, "default"))
+            logger.info("Default KG registration + pipeline + memory layer ready")
+        except Exception as agent_init_error:
+            logger.warning("Default agent prewarm skipped: %s", agent_init_error)
+            logger.info("Default KG registration + pipeline ready")
+    except Exception as e:
+        logger.warning("Default KG startup failed: %s", e)
 
 
-def _get_agent(domain: str) -> GraphRAGAgent:
-    """Get or create a cached agent for a domain."""
-    global memory_store
-    if domain not in agents:
-        pipeline = _get_pipeline(domain)
-        if not pipeline.llm:
-            raise HTTPException(status_code=503, detail="LLM not configured — agent requires LLM")
-        if memory_store is None:
-            memory_store = AgentMemory(llm=pipeline.llm)
-        agents[domain] = GraphRAGAgent(
-            pipeline=pipeline,
-            memory=memory_store,
-            llm=pipeline.llm,
-        )
-    return agents[domain]
+# ── Request/Response Models ───────────────────────────────────────────
+
+class ConnectRequest(BaseModel):
+    uri: str
+    username: str
+    password: str
+    database: str = NEO4J_DATABASE or "neo4j"
+    name: str = ""
 
 
-# ── Models ────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query: str
-    domain: str = "medical"
+    kg_id: str = "default"
 
 
 class QueryResponse(BaseModel):
@@ -89,7 +103,7 @@ class AgentQueryResponse(BaseModel):
 
 class MemoryRecallRequest(BaseModel):
     query: str
-    domain: str = "default"
+    kg_id: str = "default"
     threshold: float = 0.85
 
 
@@ -97,25 +111,118 @@ class MemoryRecallResponse(BaseModel):
     results: list[dict] = []
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────
+# ── Graph Management Endpoints ────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "version": "3.0.0"}
+    return {"status": "healthy", "version": "3.2.0"}
 
+
+@app.post("/graphs/connect")
+async def connect_graph(request: ConnectRequest):
+    """
+    Register a new knowledge graph.
+
+    Connects, discovers schema, generates config, persists credentials.
+    Returns the kg_id and schema summary.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            partial(
+                registry.register,
+                uri=request.uri,
+                username=request.username,
+                password=request.password,
+                database=request.database,
+                name=request.name,
+            ),
+        )
+
+        # Prewarm pipeline immediately so generated config is validated and active.
+        kg_id = result["kg_id"]
+        await loop.run_in_executor(None, partial(registry.get_pipeline, kg_id))
+        result["pipeline_initialized"] = True
+
+        # Prewarm memory-layer agent when LLM is available.
+        try:
+            await loop.run_in_executor(None, partial(registry.get_agent, kg_id))
+            result["memory_layer_initialized"] = True
+        except Exception as agent_init_error:
+            logger.warning("Agent prewarm skipped for %s: %s", kg_id, agent_init_error)
+            result["memory_layer_initialized"] = False
+            result["memory_layer_status"] = str(agent_init_error)
+
+        return result
+    except ConnectionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Graph connection failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graphs")
+async def list_graphs():
+    """List all registered knowledge graphs."""
+    try:
+        return {"graphs": registry.list_all()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graphs/{kg_id}")
+async def get_graph(kg_id: str):
+    """Get details for a specific KG."""
+    kg = registry.get(kg_id)
+    if kg is None:
+        raise HTTPException(status_code=404, detail=f"KG '{kg_id}' not found")
+
+    # Don't expose password in response
+    import json
+    schema = json.loads(kg.get("schema_json", "{}") or "{}")
+    return {
+        "kg_id": kg["kg_id"],
+        "name": kg["name"],
+        "uri": kg["uri"],
+        "database": kg["database"],
+        "status": kg["status"],
+        "created_at": kg["created_at"],
+        "last_used": kg["last_used"],
+        "schema": {
+            "node_labels": schema.get("node_labels", []),
+            "total_nodes": schema.get("total_nodes", 0),
+            "total_relationships": schema.get("total_relationships", 0),
+            "relationships": schema.get("relationships", []),
+        },
+    }
+
+
+@app.delete("/graphs/{kg_id}")
+async def delete_graph(kg_id: str):
+    """Remove a knowledge graph from the registry."""
+    if kg_id == "default":
+        raise HTTPException(status_code=400, detail="Cannot delete the default KG")
+    deleted = registry.delete(kg_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"KG '{kg_id}' not found")
+    return {"status": "deleted", "kg_id": kg_id}
+
+
+# ── Query Endpoints ───────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse)
 async def query_graph(request: QueryRequest):
     """
     V2.5 Pipeline query. Fast, single-pass retrieval.
-    Use /agent/query for multi-step agentic reasoning.
+    Routes to the correct KG via kg_id.
     """
     try:
-        pipeline = _get_pipeline(request.domain)
+        pipeline = registry.get_pipeline(request.kg_id)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, pipeline.query, request.query)
-        
+
         return QueryResponse(
             query=result["query"],
             answer=result["answer"],
@@ -126,10 +233,9 @@ async def query_graph(request: QueryRequest):
             hop_depth=result.get("hop_depth", 0),
             subgraph=result.get("subgraph"),
             thought_process=result.get("thought_process", []),
-            timing=result["timing"]
+            timing=result["timing"],
         )
-    except FileNotFoundError as e:
-        logger.error("Domain config not found: %s", e)
+    except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Error processing query")
@@ -140,15 +246,15 @@ async def query_graph(request: QueryRequest):
 async def agent_query(request: QueryRequest):
     """
     V3 Agentic query. Multi-step reasoning with memory and planning.
-    Slower but more thorough than /query.
+    Routes to the correct KG via kg_id. Memory is scoped per kg_id.
     """
     try:
-        agent = _get_agent(request.domain)
+        agent = registry.get_agent(request.kg_id)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, agent.execute, request.query, request.domain
+            None, agent.execute, request.query, request.kg_id
         )
-        
+
         return AgentQueryResponse(
             query=result.query,
             answer=result.answer,
@@ -158,6 +264,8 @@ async def agent_query(request: QueryRequest):
             iterations=result.iterations,
             timing=result.timing,
         )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -165,17 +273,16 @@ async def agent_query(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Memory Endpoints ─────────────────────────────────────────────────
+
 @app.post("/memory/recall", response_model=MemoryRecallResponse)
 async def recall_memory(request: MemoryRecallRequest):
-    """Search agent memory for similar past queries."""
-    global memory_store
-    if memory_store is None:
-        return MemoryRecallResponse(results=[])
-    
+    """Search agent memory for similar past queries (scoped to kg_id)."""
     try:
-        results = memory_store.recall(
+        agent = registry.get_agent(request.kg_id)
+        results = agent.memory.recall(
             query=request.query,
-            domain=request.domain,
+            domain=request.kg_id,
             threshold=request.threshold,
         )
         return MemoryRecallResponse(
@@ -192,11 +299,23 @@ async def recall_memory(request: MemoryRecallRequest):
         return MemoryRecallResponse(results=[])
 
 
-@app.get("/schema")
-async def get_schema():
-    """Return the discovered schema for the default pipeline."""
+@app.get("/memory/stats")
+async def memory_stats(kg_id: str = "default"):
+    """Return memory usage statistics for a specific KG."""
     try:
-        pipeline = _get_pipeline("medical")
+        agent = registry.get_agent(kg_id)
+        return agent.memory.stats(kg_id)
+    except Exception:
+        return {"total_memories": 0, "memories_last_hour": 0, "domain": kg_id}
+
+
+# ── Legacy Compatibility ─────────────────────────────────────────────
+
+@app.get("/schema")
+async def get_schema(kg_id: str = "default"):
+    """Return the discovered schema for a KG."""
+    try:
+        pipeline = registry.get_pipeline(kg_id)
         return {
             "node_labels": pipeline.schema.get("node_labels", []),
             "relationships": pipeline.schema.get("relationships", []),
@@ -206,15 +325,6 @@ async def get_schema():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/memory/stats")
-async def memory_stats(domain: str = "default"):
-    """Return memory usage statistics."""
-    global memory_store
-    if memory_store is None:
-        return {"total_memories": 0, "memories_last_hour": 0, "domain": domain}
-    return memory_store.stats(domain)
 
 
 if __name__ == "__main__":

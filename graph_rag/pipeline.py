@@ -268,8 +268,19 @@ class GraphRAGPipeline:
             try:
                 answer = self.llm.answer(user_query, best_context)
             except Exception as e:
-                logger.warning("LLM call failed: %s", e)
-                answer = f"(LLM error: {e})"
+                err_str = str(e)
+                logger.warning("LLM synthesis failed: %s", err_str)
+                # Graceful fallback: use the structured context as a direct answer
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    answer = (
+                        "⚠️ LLM rate limit reached — showing raw knowledge graph context.\n\n"
+                        + best_context
+                    )
+                else:
+                    answer = (
+                        "⚠️ Answer generation temporarily unavailable — "
+                        "showing knowledge graph context.\n\n" + best_context
+                    )
             timing["llm_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
         return {

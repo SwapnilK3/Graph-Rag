@@ -7,8 +7,12 @@ services:
       - "8080:8080"
     env_file:
       - .env
+    environment:
+      - GRAPH_REGISTRY_DB_PATH=/app/data/graph_registry.db
+      - GRAPH_RAG_MEMORY_DB_PATH=/app/data/graph_rag_memory.db
     volumes:
       - ./config:/app/config
+      - ./data:/app/data
     restart: always
 
   frontend:

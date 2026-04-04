@@ -33,6 +33,7 @@ import time
 import struct
 import sqlite3
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -84,8 +85,10 @@ class AgentMemory:
         Path to the SQLite database file.
     """
 
-    def __init__(self, llm, db_path: str | Path = "graph_rag_memory.db"):
+    def __init__(self, llm, db_path: str | Path | None = None):
         self.llm = llm
+        if db_path is None:
+            db_path = os.getenv("GRAPH_RAG_MEMORY_DB_PATH", "graph_rag_memory.db")
         self.db_path = str(db_path)
         self.short_term: dict[str, dict] = {}  # session-scoped
         self._init_db()
