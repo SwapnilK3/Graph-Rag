@@ -17,6 +17,7 @@ Usage
 """
 
 import os
+import logging
 from google import genai
 from google.genai import types
 
@@ -36,6 +37,9 @@ QUESTION: {query}
 
 ANSWER:\
 """
+
+
+logger = logging.getLogger(__name__)
 
 
 class LLMInterface:
@@ -71,6 +75,82 @@ class LLMInterface:
         self._client = genai.Client(api_key=key)
         self._model = model
         self._max_retries = max_retries
+
+        # Embedding model can vary across Gemini API accounts/regions/versions.
+        # We keep a preferred model plus fallbacks and auto-switch when needed.
+        preferred_embed_model = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
+        env_fallbacks = [
+            m.strip() for m in os.getenv("GEMINI_EMBED_FALLBACKS", "").split(",") if m.strip()
+        ]
+        self._embed_model = preferred_embed_model
+        self._embed_model_candidates = self._dedupe_preserve_order([
+            preferred_embed_model,
+            *env_fallbacks,
+            "gemini-embedding-001",
+            "text-embedding-004",
+            "embedding-001",
+        ])
+
+    @staticmethod
+    def _dedupe_preserve_order(values: list[str]) -> list[str]:
+        """Remove duplicates while preserving original order."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    @staticmethod
+    def _is_model_not_found_error(error: Exception) -> bool:
+        """Return True when Gemini reports model-not-found or unsupported model."""
+        text = str(error).lower()
+        return (
+            "404" in text
+            or "not_found" in text
+            or "not found" in text
+            or "is not supported for embedcontent" in text
+        )
+
+    def _embed_with_fallback(self, contents, task_type: str):
+        """
+        Try embedding with preferred model first, then fall back when model is unavailable.
+        """
+        attempts = [self._embed_model] + [
+            model for model in self._embed_model_candidates if model != self._embed_model
+        ]
+        last_error: Exception | None = None
+
+        for model_name in attempts:
+            try:
+                response = self._client.models.embed_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+                if model_name != self._embed_model:
+                    logger.info(
+                        "Embedding model switched from '%s' to '%s'",
+                        self._embed_model,
+                        model_name,
+                    )
+                    self._embed_model = model_name
+                return response
+            except Exception as error:
+                if self._is_model_not_found_error(error):
+                    last_error = error
+                    logger.warning(
+                        "Embedding model '%s' unavailable; trying fallback.",
+                        model_name,
+                    )
+                    continue
+                raise
+
+        attempted = ", ".join(attempts)
+        raise RuntimeError(
+            f"No embedding model available for embedContent. Tried: {attempted}"
+        ) from last_error
 
     def _call_with_retry(self, fn, *args, **kwargs):
         """Call a function with automatic retry on rate limit errors."""
@@ -136,11 +216,7 @@ class LLMInterface:
         Returns:
             A list of floats (embedding vector).
         """
-        response = self._client.models.embed_content(
-            model="text-embedding-004",
-            contents=text,
-            config=types.EmbedContentConfig(task_type=task_type)
-        )
+        response = self._embed_with_fallback(contents=text, task_type=task_type)
         return response.embeddings[0].values
 
     def embed_batch(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
@@ -150,9 +226,5 @@ class LLMInterface:
         if not texts:
             return []
             
-        response = self._client.models.embed_content(
-            model="text-embedding-004",
-            contents=texts,
-            config=types.EmbedContentConfig(task_type=task_type)
-        )
+        response = self._embed_with_fallback(contents=texts, task_type=task_type)
         return [e.values for e in response.embeddings]
